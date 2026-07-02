@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+sea_app/sea_models/
+sea_app/sea_outputs/
+sea_app/sea_app_models/

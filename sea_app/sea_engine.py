@@ -1,97 +1,259 @@
+# =========================================================
+# SEA-AGRIX : Self-Evolving Agriculture Intelligence Engine
+# FUTURE-PROOF BACKEND (Python 3.13 + Keras 3 SAFE)
+# =========================================================
+
 import os
 import json
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+
 from sklearn.metrics import mean_squared_error
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Input
 
-LOG_PATH = "SEA_log_stable.json"
-MODELS_DIR = "sea_app_models"
-os.makedirs(MODELS_DIR, exist_ok=True)
+# ---------------------------------------------------------
+# Setup folders
+# ---------------------------------------------------------
+os.makedirs("sea_models", exist_ok=True)
+os.makedirs("sea_outputs", exist_ok=True)
 
+LOG_FILE = "sea_outputs/SEA_log.json"
+PLOT_FILE = "sea_outputs/SEA_RMSE_plot.png"
+PRED_FILE = "sea_outputs/SEA_yield_predictions.csv"
 
+# ---------------------------------------------------------
+# SEA ENGINE
+# ---------------------------------------------------------
 class SEAEngine:
-    def __init__(self, dataset_path: str, chunk_size: int = 32, drift_threshold: float = 0.12):
-        self.df = pd.read_csv(dataset_path)
-        self.feature_cols = [c for c in self.df.columns if c != "yield"]
+
+    def __init__(self, csv_path, chunk_size=32, drift_threshold=0.25):
+        self.csv_path = csv_path
         self.chunk_size = chunk_size
         self.drift_threshold = drift_threshold
-        self.log = {"rmse_history": [], "drift_events": []}
-        self.current_model_path = None
+        self.model = None
 
-    def _build(self, input_dim):
-        m = Sequential([
-            Dense(64, activation="relu", input_shape=(input_dim,)),
-            Dropout(0.12),
+        self.log = {
+            "initial_rmse": None,
+            "rmse_per_chunk": [],
+            "drift_events": []
+        }
+
+        # ✅ FIXED indentation
+        self.live_rmse_history = []
+
+        self._load_dataset()
+
+    # -------------------------
+    # Load / Reload Dataset
+    # -------------------------
+    def _load_dataset(self):
+        self.df = pd.read_csv(self.csv_path)
+        self.features = [c for c in self.df.columns if c != "yield"]
+
+    # -------------------------
+    # Model Architecture
+    # -------------------------
+    def build_model(self, input_dim):
+        model = Sequential([
+            Input(shape=(input_dim,)),
+            Dense(64, activation="relu"),
+            Dropout(0.2),
             Dense(32, activation="relu"),
             Dense(1)
         ])
-        m.compile(optimizer="adam", loss="mse")
-        return m
+        model.compile(optimizer="adam", loss="mse")
+        return model
 
-    def train_initial(self, epochs=12):
-        X = self.df[self.feature_cols].values
+    # -------------------------
+    # Initial Training
+    # -------------------------
+    def train_initial(self):
+        X = self.df[self.features].values
         y = self.df["yield"].values
 
-        m = self._build(X.shape[1])
-        m.fit(X, y, epochs=epochs, batch_size=32, verbose=0)
+        self.model = self.build_model(X.shape[1])
+        self.model.fit(X, y, epochs=15, batch_size=32, verbose=0)
 
-        path = f"{MODELS_DIR}/sea_initial.h5"
-        m.save(path)
-        self.current_model_path = path
+        preds = self.model.predict(X).reshape(-1)
+        rmse = float(np.sqrt(mean_squared_error(y, preds)))
 
-        rmse = float(np.sqrt(mean_squared_error(y, m.predict(X).reshape(-1))))
-        self.log["rmse_history"].append({"initial": rmse})
+        self.model.save("sea_models/initial_model.keras")
+        self.log["initial_rmse"] = rmse
 
-        json.dump(self.log, open(LOG_PATH, "w"), indent=2)
-        return path, rmse
+        print("\n✅ Initial model trained")
+        print(f"📉 Initial RMSE: {rmse:.2f}")
 
-    def simulate_stream(self, retrain_epochs=6):
-        if not self.current_model_path:
-            raise RuntimeError("Run train_initial() first")
+    # -------------------------
+    # Streaming + Drift Logic
+    # -------------------------
+    def run_stream(self):
 
-        df = self.df.reset_index(drop=True)
-        n = len(df)
+        # reload dataset for live feed behavior
+        self._load_dataset()
 
-        model = load_model(self.current_model_path)
-        rmse_hist = []
+        rmse_history = []
         event_id = 0
 
-        for i in range(0, n, self.chunk_size):
-            chunk = df.iloc[i:i+self.chunk_size]
-            Xc = chunk[self.feature_cols].values
+        for i in range(0, len(self.df), self.chunk_size):
+
+            chunk_id = i // self.chunk_size
+            chunk = self.df.iloc[i:i + self.chunk_size]
+
+            Xc = chunk[self.features].values
             yc = chunk["yield"].values
 
-            preds = model.predict(Xc).reshape(-1)
+            preds = self.model.predict(Xc).reshape(-1)
             rmse = float(np.sqrt(mean_squared_error(yc, preds)))
-            rmse_hist.append(rmse)
 
-            baseline = np.mean(rmse_hist[-4:])
+            # ✅ live RMSE tracking
+            self.live_rmse_history.append(rmse)
+            self.plot_live_rmse(chunk_id)
 
-            self.log["rmse_history"].append({"chunk": i, "rmse": rmse})
+            rmse_history.append(rmse)
 
-            if len(rmse_hist) > 3 and (rmse - baseline) / (baseline + 1e-9) > self.drift_threshold:
-                # DRIFT TRIGGER
-                self.log["drift_events"].append(
-                    {"event_id": event_id, "chunk": i, "rmse": rmse, "baseline": baseline}
+            self.log["rmse_per_chunk"].append({
+                "chunk": chunk_id,
+                "rmse": rmse
+            })
+
+            baseline = np.mean(rmse_history[-3:-1]) if len(rmse_history) >= 3 else rmse
+
+            if rmse > baseline * (1 + self.drift_threshold):
+
+                print(f"\n🚨 Drift detected at chunk {chunk_id}")
+                print(f"   RMSE before retrain: {rmse:.2f}")
+
+                retrain_df = self.df.iloc[:i + self.chunk_size]
+                Xr = retrain_df[self.features].values
+                yr = retrain_df["yield"].values
+
+                weights = np.linspace(0.3, 1.0, len(yr))
+
+                self.model = self.build_model(Xr.shape[1])
+                self.model.fit(
+                    Xr, yr,
+                    sample_weight=weights,
+                    epochs=12,
+                    batch_size=32,
+                    verbose=0
                 )
 
-                # RETRAIN ON ALL DATA SEEN
-                sub_df = df.iloc[:i+self.chunk_size]
-                Xr = sub_df[self.feature_cols].values
-                yr = sub_df["yield"].values
+                preds_after = self.model.predict(Xc).reshape(-1)
+                rmse_after = float(np.sqrt(mean_squared_error(yc, preds_after)))
 
-                m2 = self._build(Xr.shape[1])
-                m2.fit(Xr, yr, epochs=retrain_epochs, verbose=0)
+                self.model.save(f"sea_models/retrained_{event_id}.keras")
 
-                new_path = f"{MODELS_DIR}/sea_retrain_{event_id}.h5"
-                m2.save(new_path)
-                model = m2
-                self.current_model_path = new_path
+                self.log["drift_events"].append({
+                    "event": event_id,
+                    "chunk": chunk_id,
+                    "baseline": float(baseline),
+                    "rmse_before": rmse,
+                    "rmse_after": rmse_after
+                })
 
+                print(f"   RMSE after retrain:  {rmse_after:.2f}")
                 event_id += 1
 
-            json.dump(self.log, open(LOG_PATH, "w"), indent=2)
+        self.save_outputs()
+        self.plot_rmse()
+        self.save_predictions()
 
-        return LOG_PATH
+    # -------------------------
+    # Save Logs
+    # -------------------------
+    def save_outputs(self):
+        with open(LOG_FILE, "w") as f:
+            json.dump(self.log, f, indent=2)
+        print(f"\n📁 Log saved to {LOG_FILE}")
+
+    # -------------------------
+    # Simulation RMSE Plot
+    # -------------------------
+    def plot_rmse(self):
+        chunks = [r["chunk"] for r in self.log["rmse_per_chunk"]]
+        rmse_vals = [r["rmse"] for r in self.log["rmse_per_chunk"]]
+
+        drift_chunks = [d["chunk"] for d in self.log["drift_events"]]
+        before = [d["rmse_before"] for d in self.log["drift_events"]]
+        after = [d["rmse_after"] for d in self.log["drift_events"]]
+
+        plt.figure(figsize=(12,6))
+        plt.plot(chunks, rmse_vals, marker="o", label="RMSE per chunk")
+        plt.scatter(drift_chunks, before, color="red", s=160, label="Before retrain")
+        plt.scatter(drift_chunks, after, color="green", s=160, label="After retrain")
+
+        for c in drift_chunks:
+            plt.axvline(c, linestyle="--", color="gray", alpha=0.4)
+
+        plt.title("SEA-AGRIX: Drift Detection & Self-Evolving Learning")
+        plt.xlabel("Chunk Index")
+        plt.ylabel("RMSE")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(PLOT_FILE, dpi=300)
+        plt.close()
+
+        print(f"📊 Simulation RMSE plot saved to {PLOT_FILE}")
+
+    # -------------------------
+    # LIVE RMSE Plot (NEW, FIXED)
+    # -------------------------
+    def plot_live_rmse(self, cycle_id):
+        plt.figure(figsize=(10,5))
+        plt.plot(
+            range(1, len(self.live_rmse_history) + 1),
+            self.live_rmse_history,
+            marker="o",
+            color="orange",
+            linewidth=2
+        )
+        plt.title(f"LIVE RMSE Evolution (Cycle {cycle_id})")
+        plt.xlabel("Live Step")
+        plt.ylabel("RMSE")
+        plt.grid(True)
+        plt.tight_layout()
+
+        live_plot_path = f"sea_outputs/live_rmse_cycle_{cycle_id}.png"
+        plt.savefig(live_plot_path, dpi=300)
+        plt.close()
+
+        print(f"📈 Live RMSE graph updated → {live_plot_path}")
+
+    # -------------------------
+    # Final Predictions
+    # -------------------------
+    def save_predictions(self):
+        final_chunk = self.df.iloc[-self.chunk_size:]
+        Xf = final_chunk[self.features].values
+        y_true = final_chunk["yield"].values
+        y_pred = self.model.predict(Xf).reshape(-1)
+
+        pred_df = pd.DataFrame({
+            "Actual_Yield": y_true,
+            "Predicted_Yield": y_pred,
+            "Error": y_pred - y_true
+        })
+
+        pred_df.to_csv(PRED_FILE, index=False)
+
+        print("\n🌾 SAMPLE YIELD PREDICTIONS")
+        print(pred_df.head(10))
+        print(f"\n📁 Predictions saved to {PRED_FILE}")
+
+# =========================================================
+# RUN
+# =========================================================
+
+engine = SEAEngine(
+    csv_path="dataset_master.csv",
+    chunk_size=32,
+    drift_threshold=0.25
+)
+
+engine.train_initial()
+engine.run_stream()
+
+print("\n✅ SEA-AGRIX FUTURE-PROOF BACKEND COMPLETED")

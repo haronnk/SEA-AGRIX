@@ -1,87 +1,172 @@
 import streamlit as st
-import pandas as pd
 import os
+import time
+import json
 
 from sea_engine import SEAEngine
-from model_loader import get_model_names, load_model_by_name
-from alerts_engine import generate_alerts
+from data_feed import append_live_data
 
-st.set_page_config(page_title="SEA-AGRIX Dashboard", layout="wide")
+# -------------------------
+# Paths
+# -------------------------
+DATASET_PATH = "dataset_master.csv"
+BASE_PLOT_FILE = "sea_outputs/SEA_RMSE_plot.png"
+LOG_FILE = "sea_outputs/SEA_log.json"
 
-st.title("🌾 SEA-AGRIX — Self-Evolving AutoML for Crop Yield")
+# -------------------------
+# Session State
+# -------------------------
+if "live_running" not in st.session_state:
+    st.session_state.live_running = False
 
-tabs = st.tabs(["Overview", "Data", "Models", "SEA Monitor", "Alerts", "Deploy"])
+if "live_cycle" not in st.session_state:
+    st.session_state.live_cycle = 0
 
-# -------------------------------------------------------------------
+if "live_plots" not in st.session_state:
+    st.session_state.live_plots = []
+
+# -------------------------
+# Page Config
+# -------------------------
+st.set_page_config(
+    page_title="SEA-AGRIX",
+    layout="wide"
+)
+
+st.title("🌱 SEA-AGRIX: Self-Evolving Agriculture Intelligence")
+
+tabs = st.tabs([
+    "Overview",
+    "Run Simulation",
+    "Run Live",
+    "Results",
+    "Logs"
+])
+
+# =========================================================
+# OVERVIEW
+# =========================================================
 with tabs[0]:
-    st.header("Overview")
-    st.write("""
-    SEA-AGRIX is a self-evolving ML system that:
-    - Detects data drift  
-    - Retrains automatically  
-    - Tracks RMSE over time  
-    - Allows model selection  
+    st.markdown("""
+    **SEA-AGRIX** is a self-evolving ML system that:
+
+    - Predicts crop yield  
+    - Detects concept drift  
+    - Automatically retrains itself  
+    - Supports continuous live data streams  
     """)
 
-# -------------------------------------------------------------------
+# =========================================================
+# RUN SIMULATION (STATIC)
+# =========================================================
 with tabs[1]:
-    st.header("Data Upload")
+    st.header("Run Simulation")
 
-    up = st.file_uploader("Upload dataset CSV (must include `yield` column)", type=['csv'])
+    if st.button("▶️ Run Simulation"):
+        # Reset live state
+        st.session_state.live_running = False
+        st.session_state.live_cycle = 0
+        st.session_state.live_plots = []
 
-    if up:
-        df = pd.read_csv(up)
-        st.session_state['df'] = df
-        df.to_csv("dataset_master.csv", index=False)
-        st.success("Dataset loaded")
-        st.write(df.head())
+        engine = SEAEngine(
+            csv_path=DATASET_PATH,
+            chunk_size=32,
+            drift_threshold=0.25
+        )
 
-# -------------------------------------------------------------------
+        engine.train_initial()
+        engine.run_stream()
+
+        st.success("Simulation completed")
+
+# =========================================================
+# RUN LIVE SYSTEM (CONTINUOUS)
+# =========================================================
 with tabs[2]:
-    st.header("Model Explorer")
+    st.header("Run Live System")
 
-    models = get_model_names()
-    st.write("Available models:", models)
+    col1, col2 = st.columns(2)
 
-    choice = st.selectbox("Select model", ["None"] + models)
+    with col1:
+        if st.button("▶️ Start Live System"):
+            st.session_state.live_running = True
+            st.success("Live system started")
 
-    if choice != "None":
-        if st.button("Test on first 5 rows"):
-            df = st.session_state.get('df')
-            if df is not None:
-                m = load_model_by_name(choice)
-                X = df.drop(columns=["yield"]).values[:5]
-                preds = m.predict(X).reshape(-1)
-                st.write(preds)
+    with col2:
+        if st.button("⏹ Stop Live System"):
+            st.session_state.live_running = False
+            st.warning("Live system stopped")
 
-# -------------------------------------------------------------------
+    # -------------------------
+    # LIVE LOOP
+    # -------------------------
+    if st.session_state.live_running:
+
+        st.session_state.live_cycle += 1
+        cycle_id = st.session_state.live_cycle
+
+        st.info(f"🔁 Live Cycle {cycle_id}")
+
+        engine = SEAEngine(
+            csv_path=DATASET_PATH,
+            chunk_size=32,
+            drift_threshold=0.25
+        )
+
+        # Append new live data
+        append_live_data(
+            csv_path=DATASET_PATH,
+            n_rows=engine.chunk_size
+        )
+
+        # Train + evaluate
+        engine.train_initial()
+        engine.run_stream()
+
+        # Save plot uniquely (NO overwrite)
+        if os.path.exists(BASE_PLOT_FILE):
+            live_plot_path = f"sea_outputs/live_rmse_cycle_{cycle_id}.png"
+
+            if os.path.exists(live_plot_path):
+                os.remove(live_plot_path)
+
+            os.rename(BASE_PLOT_FILE, live_plot_path)
+            st.session_state.live_plots.append(live_plot_path)
+
+        st.success("Live cycle completed")
+
+        time.sleep(3)
+        st.rerun()
+
+# =========================================================
+# RESULTS
+# =========================================================
 with tabs[3]:
-    st.header("Run SEA")
+    st.header("Results")
 
-    if st.button("Start SEA Training + Streaming"):
-        engine = SEAEngine("dataset_master.csv", chunk_size=32)
-        path, rmse = engine.train_initial()
-        st.write("Initial model RMSE:", rmse)
+    if st.session_state.live_plots:
+        st.subheader("Live System Results")
 
-        logpath = engine.simulate_stream()
-        st.success("SEA Completed!")
-        st.write(open(logpath).read())
+        for i, plot in enumerate(st.session_state.live_plots, start=1):
+            st.markdown(f"**Live Cycle {i}**")
+            st.image(plot)
 
-# -------------------------------------------------------------------
+    elif os.path.exists(BASE_PLOT_FILE):
+        st.subheader("Simulation Result")
+        st.image(BASE_PLOT_FILE)
+
+    else:
+        st.info("Run simulation or live system to see results")
+
+# =========================================================
+# LOGS
+# =========================================================
 with tabs[4]:
-    st.header("System Alerts")
-    for a in generate_alerts():
-        st.info(a)
+    st.header("Logs")
 
-# -------------------------------------------------------------------
-with tabs[5]:
-    st.header("Deploy App")
-    st.write("""
-    Deploy on **Streamlit Cloud**:
-    
-    1. Push repo to GitHub  
-    2. Visit https://share.streamlit.io  
-    3. Select your repo  
-    4. Set entrypoint = `sea_app/streamlit_app.py`  
-    """)
-
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as f:
+            log = json.load(f)
+        st.json(log)
+    else:
+        st.info("No logs available yet")
